@@ -12,107 +12,124 @@
 #include <iterator>
 #include <torch/extension.h>
 #include <torch/types.h>
+#include <ATen/ATen.h>
+#include <ATen/native/TensorIterator.h>
+#include <ATen/native/cpu/Loops.h>
+#include <ATen/native/ReduceOpsUtils.h>
+#include <ATen/AccumulateType.h>
 
-#define ENCODE_BIT 32
+#define BIT 64
+#define TYPE int64_t
+#define UTYPE uint64_t
+#define DTYPE torch::kI64
+#define POPCOUNT __builtin_popcountll
 
-
-void encode_rows_cpu_kernel(float *columns, int32_t *columns_binary, int m, int l) {
-    for (int i = 0; i < m * l; ++i) {
-        int32_t r = 0;
-        for (int j = 0; j < ENCODE_BIT; ++j) {
-            int32_t sign = (columns[ENCODE_BIT * i + j] > 0);
-            r |= (sign << j);
-        }
-        columns_binary[i] = r;
-    }
-}
-
-
-torch::Tensor encode_rows_cpu(torch::Tensor &input) {
-    const int m = input.size(0);
-    const int n = input.size(1);
-    const int l = (n - 1) / ENCODE_BIT + 1;
-    torch::Tensor output = torch::ones({m, l}, torch::kInt);
-
-    // Convert tensor to the C pointer
-    float *a = (float *)input.data_ptr<float>();
-    int32_t *b = (int32_t *)output.data_ptr<int>();
-
-    encode_rows_cpu_kernel(a, b, m, l);
-    return output;
-}
-
-
-void encode_cols_cpu_kernel(float *columns, int32_t *columns_binary, int l, int n)  {
-    int col_bin_m = l;
-
-    for (int i = 0; i < col_bin_m; ++i) {
-        for (int k = 0; k < n; ++k) {
-            int32_t r = 0;
-            for (int j = 0; j < ENCODE_BIT; ++j) {
-                int32_t sign = (columns[(i * n * ENCODE_BIT + k) + j * n] > 0);
-                r |= (sign << j);
+at::Tensor pak(at::Tensor &olda) {
+    auto a = olda.unflatten(-1, {-1,BIT});
+    auto out = at::empty(a.index({"...",0}).sizes(), DTYPE);
+    at::TensorIteratorConfig()
+        .set_check_mem_overlap(false)
+        .check_all_same_dtype(false)
+        .resize_outputs(false)
+        .is_reduction(true)
+        .declare_static_shape(a.sizes())
+        .add_owned_output(out)
+        .add_owned_input(a)
+        .build()
+        .for_each([](char **dat, const long *stride, long n){
+            UTYPE r = 0;
+            for(long i=0; i<n; i++) {
+                r |= (UTYPE)*(unsigned char*)(dat[1]+(i+1)*stride[1]-1) >> 7 << i;
             }
-            columns_binary[i * n + k] = r;
-        }
-        
-    }
+            *(UTYPE*)dat[0] = r;
+        });
+    return out;
 }
 
-
-torch::Tensor encode_cols_cpu(torch::Tensor &input) {
-    const int n = input.size(0);
-    const int k = input.size(1);
-    const int l = 1 + (n - 1) / ENCODE_BIT;
-
-    torch::Tensor output = torch::ones({l, k}, torch::kInt);
-
-    float *a = input.data_ptr<float>();
-    int32_t *b = (int32_t *)output.data_ptr<int>();
-    encode_cols_cpu_kernel(a, b, l, k);
-
-    return output;
-}
-
-
-torch::Tensor xnor_gemm_cpu(torch::Tensor &a, torch::Tensor &b) {
-    torch::Tensor output = torch::zeros({a.size(0), b.size(1)});
-
-    // row dimension of matrix A
-    for(int i = 0; i < a.size(0); ++i) {
-        // column dimension of matirx B
-        for(int j = 0; j < b.size(1); ++j) {
-            int32_t c = 0; // every j loop make c equals to 0
-            // column dimension of A = row dimension of B
-            for (int i2 = 0; i2 < a.size(1); ++i2) {
-                // Use ~XOR to implement XNOR because of no XNOR operation in C++ std
-                c += 2 * __builtin_popcount(  ~( a[i][i2].item<int>() ^ b[i2][j].item<int>() ) );
+at::Tensor mm_f(at::Tensor &a, at::Tensor &b) {
+    auto size = at::broadcast_tensors({a, b})[0].sizes();
+    auto out = at::empty(std::vector<long>(size.begin(), size.end()-1), torch::kF32);
+    at::TensorIteratorConfig()
+        .set_check_mem_overlap(false)
+        .check_all_same_dtype(false)
+        .resize_outputs(false)
+        .is_reduction(true)
+        .declare_static_shape(size)
+        .add_owned_output(out)
+        .add_owned_input(a)
+        .add_owned_input(b)
+        .build()
+        .for_each([](char **dat, const long *stride, long n){
+            long t = 0;
+            for(long i=0; i<n; i++) {
+                t += POPCOUNT(*(UTYPE*)(dat[1]+i*stride[1]) ^ *(UTYPE*)(dat[2]+i*stride[2]));
             }
-            output[i][j] = c - (a.size(1) * ENCODE_BIT);  // Sum and minus length of input
-        }
-    }
-    return output;
+            *(float*)dat[0] = n * BIT - t * 2;
+        });
+    return out;
 }
 
-
-torch::Tensor naive_gemm_cpu(torch::Tensor a, torch::Tensor b) {
-    torch::Tensor output = torch::zeros({a.size(0),b.size(1)});
-    for (int i = 0; i < a.size(0); i++) {   
-        for(int j = 0; j < b.size(1); j++) {
-            int32_t c = 0;
-            for (int i2 = 0; i2 < a.size(1); i2++) {
-                c += a[i][i2].item<float>() * b[i2][j].item<float>();
+at::Tensor mm_i1(at::Tensor &a, at::Tensor &b) {
+    auto size = at::broadcast_tensors({a, b})[0].sizes();
+    auto out = at::empty(std::vector<long>(size.begin(), size.end()-1), torch::kI8);
+    at::TensorIteratorConfig()
+        .set_check_mem_overlap(false)
+        .check_all_same_dtype(false)
+        .resize_outputs(false)
+        .is_reduction(true)
+        .declare_static_shape(size)
+        .add_owned_output(out)
+        .add_owned_input(a)
+        .add_owned_input(b)
+        .build()
+        .for_each([](char **dat, const long *stride, long n){
+            char t = 0;
+            for(long i=0; i<n; i++) {
+                t += POPCOUNT(*(UTYPE*)(dat[1]+i*stride[1]) ^ *(UTYPE*)(dat[2]+i*stride[2]));
             }
-            output[i][j] = c;
-        }
-    }
-    return output;
+            *(char*)dat[0] = n * BIT - t * 2;
+        });
+    return out;
 }
 
+at::Tensor mm(at::Tensor &a, at::Tensor &b) {
+    at::Tensor t = mm_i1(a, b);
+    return pak(t);
+}
+
+at::Tensor mm_cont(at::Tensor &olda, at::Tensor &oldb) {
+    auto a = olda.unflatten(-2, {-1,BIT}).flatten(-2);
+    auto b = oldb.unflatten(-2, {-1,BIT}).flatten(-2);
+    auto size = at::broadcast_tensors({a, b})[0].sizes();
+    auto out = at::empty(std::vector<long>(size.begin(), size.end()-1), torch::kI8);
+    at::TensorIteratorConfig()
+        .set_check_mem_overlap(false)
+        .check_all_same_dtype(false)
+        .resize_outputs(false)
+        .is_reduction(true)
+        .declare_static_shape(size)
+        .add_owned_output(out)
+        .add_owned_input(a)
+        .add_owned_input(b)
+        .build()
+        .for_each([](char **dat, const long *stride, long n){
+            UTYPE r = 0;
+            for(int i=0; i<BIT; i++) {
+                UTYPE t = 0;
+                for(long j=0; j<n / BIT; j++) {
+                    t += POPCOUNT(*(UTYPE*)(dat[1]+(i*n/BIT+j)*stride[1]) ^ *(UTYPE*)(dat[2]+(i*n/BIT+j)*stride[2]));
+                }
+                r |= t >> 63 << i;
+            }
+            *(UTYPE*)dat[0] = r;
+        });
+    return out;
+}
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("encode_rows_cpu",&encode_rows_cpu,"encode_rows_cpu");
-    m.def("encode_cols_cpu",&encode_cols_cpu,"encode_cols_cpu");
-    m.def("xnor_gemm_cpu",&xnor_gemm_cpu,"xnor_gemm_cpu");
-    m.def("naive_gemm_cpu",&naive_gemm_cpu,"naive_gemm_cpu");
+    m.def("pak", &pak, "pak");
+    m.def("mm_f", &mm_f, "mm_f");
+    m.def("mm_i1", &mm_i1, "mm_i1");
+    m.def("mm", &mm, "mm");
+    m.def("mm_cont", &mm, "mm_cont");
 }
